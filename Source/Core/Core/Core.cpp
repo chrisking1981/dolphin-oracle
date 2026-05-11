@@ -43,6 +43,7 @@
 #include "Core/Boot/Boot.h"
 #include "Core/BootManager.h"
 #include "Core/CPUThreadConfigCallback.h"
+#include "Core/DolphinOracle.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/ConfigManager.h"
 #include "Core/CoreTiming.h"
@@ -238,6 +239,10 @@ bool Init(Core::System& system, std::unique_ptr<BootParameters> boot, const Wind
 
   INFO_LOG_FMT(BOOT, "Starting core = {} mode", system.IsWii() ? "Wii" : "GameCube");
   INFO_LOG_FMT(BOOT, "CPU Thread separate = {}", system.IsDualCoreMode() ? "Yes" : "No");
+
+  // DolphinOracle hello-world: confirm our integration plumbing works.
+  // Real TCP server starts in subsequent commits.
+  DolphinOracle::Init(system);
 
   // Manually reactivate the video backend in case a GameINI overrides the video backend setting.
   VideoBackendBase::PopulateBackendInfo(wsi);

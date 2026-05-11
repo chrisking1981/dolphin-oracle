@@ -28,21 +28,23 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros">
-    <CmakeGenerator>"Visual Studio $(VisualStudioVersion.Substring(0,2))"</CmakeGenerator>
+    <CmakeGenerator>Ninja</CmakeGenerator>
     <DevCmdArch Condition="'$(Platform)'=='x64'">amd64</DevCmdArch>
 	<DevCmdArch Condition="'$(Platform)'=='ARM64'">arm64</DevCmdArch>
+    <CmakePath>"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"</CmakePath>
+    <NinjaPath>"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"</NinjaPath>
     <CmakeReleaseCLI>call vsdevcmd.bat -arch=$(DevCmdArch)
-      cmake -G $(CmakeGenerator) -A $(Platform) -DCMAKE_BUILD_TYPE="Release" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DGLSLANG_TESTS=OFF -DENABLE_GLSLANG_BINARIES=OFF -DBUILD_EXTERNAL=OFF -DENABLE_SPVREMAPPER=OFF -DENABLE_HLSL=OFF -DENABLE_OPT=OFF -DENABLE_EXCEPTIONS=OFF -S glslang -B "$(BuildRootDir)tmp\$(ProjectName)-$(Configuration)-$(Platform)"
+      $(CmakePath) -G $(CmakeGenerator) -DCMAKE_BUILD_TYPE="Release" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL -DCMAKE_MAKE_PROGRAM=$(NinjaPath) -DGLSLANG_TESTS=OFF -DENABLE_GLSLANG_BINARIES=OFF -DBUILD_EXTERNAL=OFF -DENABLE_SPVREMAPPER=OFF -DENABLE_HLSL=OFF -DENABLE_OPT=OFF -DENABLE_EXCEPTIONS=OFF -S glslang -B "$(BuildRootDir)tmp\$(ProjectName)-$(Configuration)-$(Platform)"
     </CmakeReleaseCLI>
     <CmakeDebugCLI>call vsdevcmd.bat -arch=$(DevCmdArch)
-      cmake -G $(CmakeGenerator) -A $(Platform) -DCMAKE_BUILD_TYPE="Debug" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDebug -DGLSLANG_TESTS=OFF -DENABLE_GLSLANG_BINARIES=OFF -DBUILD_EXTERNAL=OFF -DENABLE_SPVREMAPPER=OFF -DENABLE_HLSL=OFF -DENABLE_OPT=OFF -DENABLE_EXCEPTIONS=OFF -S glslang -B "$(BuildRootDir)tmp\$(ProjectName)-$(Configuration)-$(Platform)"
+      $(CmakePath) -G $(CmakeGenerator) -DCMAKE_BUILD_TYPE="Debug" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLLDebug -DCMAKE_MAKE_PROGRAM=$(NinjaPath) -DGLSLANG_TESTS=OFF -DENABLE_GLSLANG_BINARIES=OFF -DBUILD_EXTERNAL=OFF -DENABLE_SPVREMAPPER=OFF -DENABLE_HLSL=OFF -DENABLE_OPT=OFF -DENABLE_EXCEPTIONS=OFF -S glslang -B "$(BuildRootDir)tmp\$(ProjectName)-$(Configuration)-$(Platform)"
     </CmakeDebugCLI>
     <CmakeCopyCLI>
       echo Copying..
-      if not exist "$(BuildRootDir)$(Platform)\$(Configuration)\$(ProjectName)\bin\" mkdir -p "$(BuildRootDir)$(Platform)\$(Configuration)\$(ProjectName)\bin\"
-      copy "$(BuildRootDir)tmp\$(ProjectName)-$(Configuration)-$(Platform)\SPIRV\$(CONFIGURATION)\*.lib" "$(BuildRootDir)$(Platform)\$(Configuration)\$(ProjectName)\bin"
-      copy "$(BuildRootDir)tmp\$(ProjectName)-$(Configuration)-$(Platform)\glslang\OSDependent\Windows\$(CONFIGURATION)\*.lib" "$(BuildRootDir)$(Platform)\$(Configuration)\$(ProjectName)\bin"
-      copy "$(BuildRootDir)tmp\$(ProjectName)-$(Configuration)-$(Platform)\glslang\$(CONFIGURATION)\*.lib" "$(BuildRootDir)$(Platform)\$(Configuration)\$(ProjectName)\bin"
+      if not exist "$(BuildRootDir)$(Platform)\$(Configuration)\$(ProjectName)\bin\" mkdir "$(BuildRootDir)$(Platform)\$(Configuration)\$(ProjectName)\bin\"
+      copy "$(BuildRootDir)tmp\$(ProjectName)-$(Configuration)-$(Platform)\SPIRV\*.lib" "$(BuildRootDir)$(Platform)\$(Configuration)\$(ProjectName)\bin"
+      copy "$(BuildRootDir)tmp\$(ProjectName)-$(Configuration)-$(Platform)\glslang\OSDependent\Windows\*.lib" "$(BuildRootDir)$(Platform)\$(Configuration)\$(ProjectName)\bin"
+      copy "$(BuildRootDir)tmp\$(ProjectName)-$(Configuration)-$(Platform)\glslang\*.lib" "$(BuildRootDir)$(Platform)\$(Configuration)\$(ProjectName)\bin"
     </CmakeCopyCLI>
     <CmakeCleanCLI>
       echo Cleaning..
@@ -56,17 +58,17 @@
     <IntDir>$(BuildRootDir)tmp\$(ProjectName)-$(Configuration)-$(Platform)\</IntDir>
     <NMakeBuildCommandLine>
       $(CmakeReleaseCLI)
-      msbuild.exe "$(IntDir)\ALL_BUILD.vcxproj" /t:build /p:Configuration=Release /p:ForceImportBeforeCppTargets="$(PropsAbsPath)" /m
+      $(NinjaPath) -C $(IntDir).
       $(CmakeCopyCLI)
     </NMakeBuildCommandLine>
     <NMakeReBuildCommandLine>
       $(CmakeReleaseCLI)
-      msbuild.exe "$(IntDir)\ALL_BUILD.vcxproj" /t:rebuild /p:Configuration=Release /p:ForceImportBeforeCppTargets="$(PropsAbsPath)" /m
+      $(NinjaPath) -C $(IntDir). clean
+      $(NinjaPath) -C $(IntDir).
       $(CmakeCopyCLI)
     </NMakeReBuildCommandLine>
     <NMakeCleanCommandLine>
-      $(CmakeReleaseCLI)
-      msbuild.exe "$(IntDir)\ALL_BUILD.vcxproj" /t:clean /p:Configuration=Release /p:ForceImportBeforeCppTargets="$(PropsAbsPath)" /m
+      $(NinjaPath) -C $(IntDir). clean
       $(CmakeCleanCLI)
     </NMakeCleanCommandLine>
   </PropertyGroup>
@@ -75,17 +77,17 @@
     <IntDir>$(BuildRootDir)tmp\$(ProjectName)-$(Configuration)-$(Platform)\</IntDir>
     <NMakeBuildCommandLine>
       $(CmakeDebugCLI)
-      msbuild.exe "$(IntDir)\ALL_BUILD.vcxproj" /t:build /p:Configuration=Debug /p:ForceImportBeforeCppTargets="$(PropsAbsPath)" /m
+      $(NinjaPath) -C $(IntDir).
       $(CmakeCopyCLI)
     </NMakeBuildCommandLine>
     <NMakeReBuildCommandLine>
       $(CmakeDebugCLI)
-      msbuild.exe "$(IntDir)\ALL_BUILD.vcxproj" /t:rebuild /p:Configuration=Debug /p:ForceImportBeforeCppTargets="$(PropsAbsPath)" /m
+      $(NinjaPath) -C $(IntDir). clean
+      $(NinjaPath) -C $(IntDir).
       $(CmakeCopyCLI)
     </NMakeReBuildCommandLine>
     <NMakeCleanCommandLine>
-      $(CmakeDebugCLI)
-      msbuild.exe "$(IntDir)\ALL_BUILD.vcxproj" /t:clean /p:Configuration=Debug /p:ForceImportBeforeCppTargets="$(PropsAbsPath)" /m
+      $(NinjaPath) -C $(IntDir). clean
       $(CmakeCleanCLI)
     </NMakeCleanCommandLine>
   </PropertyGroup>
