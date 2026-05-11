@@ -9,6 +9,7 @@
 #include "Core/HW/GCPadEmu.h"
 #include "InputCommon/ControllerEmu/ControlGroup/ControlGroup.h"
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
+#include "Core/DolphinOracle.h"
 #include "InputCommon/GCPadStatus.h"
 #include "InputCommon/InputConfig.h"
 
@@ -58,6 +59,12 @@ bool IsInitialized()
 
 GCPadStatus GetStatus(int pad_num)
 {
+  // Dolphin Oracle hook: if a TCP client recently sent BUTTONSTATES_GC for
+  // this pad, return that state instead of reading the user's physical
+  // controller. Auto-expires after HIJACK_TIMEOUT_MS.
+  GCPadStatus forced{};
+  if (DolphinOracle::GetForcedGCPadStatus(pad_num, &forced))
+    return forced;
   return static_cast<GCPad*>(s_config.GetController(pad_num))->GetInput();
 }
 

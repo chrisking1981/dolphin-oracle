@@ -22,6 +22,8 @@
 
 #include <cstdint>
 
+struct GCPadStatus;
+
 namespace Core
 {
 class System;
@@ -39,5 +41,14 @@ void Init(Core::System& system);
 
 // Stop the server thread, close clients. Idempotent.
 void Shutdown();
+
+// BUTTONSTATES_GC hook: called from Pad::GetStatus() in the CPU thread.
+// If a TCP client has recently sent BUTTONSTATES_GC for this pad, this
+// returns true and fills *out_status with the forced state. Otherwise
+// returns false and Pad continues with normal input.
+//
+// Auto-expires after HIJACK_TIMEOUT_MS (500ms) so a missed unhijack
+// doesn't permanently steal control from the human player.
+bool GetForcedGCPadStatus(int pad_num, GCPadStatus* out_status);
 
 }  // namespace DolphinOracle

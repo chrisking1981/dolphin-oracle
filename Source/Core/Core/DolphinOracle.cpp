@@ -26,7 +26,14 @@
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/State.h"
 #include "Core/System.h"
+#include "InputCommon/GCPadStatus.h"
 #include "VideoCommon/FrameDumper.h"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <iomanip>
 
 namespace DolphinOracle
 {
@@ -34,18 +41,56 @@ namespace DolphinOracle
 namespace
 {
 
+struct Subscription
+{
+  std::uint32_t addr;
+  std::uint32_t mode;       // 8 | 16 | 32
+  std::uint32_t prev_value; // ~0u on first poll so we always emit first event
+};
+
+struct SubscriptionMulti
+{
+  std::uint32_t addr;
+  std::uint32_t size;             // bytes
+  std::vector<std::uint8_t> prev; // last seen bytes
+};
+
 struct Client
 {
   std::unique_ptr<sf::TcpSocket> socket;
   std::string recv_buf;
+  std::vector<Subscription> subs;
+  std::vector<SubscriptionMulti> subs_multi;
+};
+
+// Forced-GCPad state. Per-pad hijack: client sets buttons, we keep that
+// state alive for HIJACK_TIMEOUT_MS, then reset to "no controller" so the
+// user can take over again.
+struct ForcedGCPad
+{
+  std::atomic<bool> active{false};
+  std::atomic<std::int64_t> expire_ms{0};
+  std::mutex status_mtx;
+  GCPadStatus status{};
 };
 
 static std::atomic<bool> s_running{false};
 static std::thread s_thread;
+static std::thread s_sub_thread;
 static sf::TcpListener s_listener;
 static std::mutex s_clients_mtx;
 static std::vector<Client> s_clients;
 static Core::System* s_system = nullptr;
+
+static constexpr int SUB_POLL_MS = 50;       // 20 Hz subscription polling
+static constexpr int HIJACK_TIMEOUT_MS = 500;
+static std::array<ForcedGCPad, 4> s_forced_pads;
+
+static std::int64_t NowMs()
+{
+  using namespace std::chrono;
+  return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -234,6 +279,151 @@ static std::string HandleWriteMulti(const std::vector<std::string>& toks)
   return "SUCCESS " + std::to_string(count);
 }
 
+// ---------------------------------------------------------------------------
+// SUBSCRIBE / UNSUBSCRIBE
+// ---------------------------------------------------------------------------
+
+// NOTE: these need access to the current Client. We thread a pointer through
+// the dispatcher. To keep handler signatures simple we use a thread-local-ish
+// trick: stash the current client in a static during dispatch.
+static thread_local Client* tl_current_client = nullptr;
+
+static std::string HandleSubscribe(const std::vector<std::string>& toks)
+{
+  if (toks.size() < 3)
+    return "FAIL usage: SUBSCRIBE <8|16|32> <addr_hex>";
+  if (!tl_current_client)
+    return "FAIL no client context";
+  std::uint32_t mode = 0;
+  if (toks[1] == "8") mode = 8;
+  else if (toks[1] == "16") mode = 16;
+  else if (toks[1] == "32") mode = 32;
+  else return "FAIL bad mode (use 8|16|32)";
+  std::uint32_t addr = 0;
+  if (!ParseHex(toks[2], addr))
+    return "FAIL bad addr";
+  // Reject duplicate
+  for (const auto& s : tl_current_client->subs)
+    if (s.addr == addr && s.mode == mode)
+      return "SUCCESS already subscribed";
+  tl_current_client->subs.push_back({addr, mode, ~0u});
+  return "SUCCESS";
+}
+
+static std::string HandleSubscribeMulti(const std::vector<std::string>& toks)
+{
+  if (toks.size() < 3)
+    return "FAIL usage: SUBSCRIBE_MULTI <size_dec> <addr_hex>";
+  if (!tl_current_client)
+    return "FAIL no client context";
+  std::uint32_t size = 0;
+  try { size = static_cast<std::uint32_t>(std::stoul(toks[1])); }
+  catch (...) { return "FAIL bad size"; }
+  if (size == 0 || size > 4096)
+    return "FAIL size out of range (1..4096)";
+  std::uint32_t addr = 0;
+  if (!ParseHex(toks[2], addr))
+    return "FAIL bad addr";
+  for (const auto& s : tl_current_client->subs_multi)
+    if (s.addr == addr && s.size == size)
+      return "SUCCESS already subscribed";
+  SubscriptionMulti sm;
+  sm.addr = addr;
+  sm.size = size;
+  sm.prev.assign(size, 0xFF);  // force first-poll diff
+  tl_current_client->subs_multi.push_back(std::move(sm));
+  return "SUCCESS";
+}
+
+static std::string HandleUnsubscribe(const std::vector<std::string>& toks)
+{
+  if (toks.size() < 2)
+    return "FAIL usage: UNSUBSCRIBE <addr_hex>";
+  if (!tl_current_client)
+    return "FAIL no client context";
+  std::uint32_t addr = 0;
+  if (!ParseHex(toks[1], addr))
+    return "FAIL bad addr";
+  auto& v = tl_current_client->subs;
+  auto it = std::remove_if(v.begin(), v.end(),
+                           [&](const Subscription& s) { return s.addr == addr; });
+  const bool removed = (it != v.end());
+  v.erase(it, v.end());
+  return removed ? "SUCCESS" : "SUCCESS not subscribed";
+}
+
+static std::string HandleUnsubscribeMulti(const std::vector<std::string>& toks)
+{
+  if (toks.size() < 2)
+    return "FAIL usage: UNSUBSCRIBE_MULTI <addr_hex>";
+  if (!tl_current_client)
+    return "FAIL no client context";
+  std::uint32_t addr = 0;
+  if (!ParseHex(toks[1], addr))
+    return "FAIL bad addr";
+  auto& v = tl_current_client->subs_multi;
+  auto it = std::remove_if(v.begin(), v.end(),
+                           [&](const SubscriptionMulti& s) { return s.addr == addr; });
+  const bool removed = (it != v.end());
+  v.erase(it, v.end());
+  return removed ? "SUCCESS" : "SUCCESS not subscribed";
+}
+
+// ---------------------------------------------------------------------------
+// BUTTONSTATES_GC
+// Protocol: BUTTONSTATES_GC <pad> <buttons_hex> <sx> <sy> <csx> <csy>
+//   sticks are floats in [-1.0, 1.0], 0 = center
+// ---------------------------------------------------------------------------
+
+static std::string HandleButtonStatesGC(const std::vector<std::string>& toks)
+{
+  if (toks.size() < 7)
+    return "FAIL usage: BUTTONSTATES_GC <pad> <buttons_hex> <sx> <sy> <csx> <csy>";
+  int pad = 0;
+  std::uint32_t buttons = 0;
+  float sx = 0, sy = 0, csx = 0, csy = 0;
+  try
+  {
+    pad = std::stoi(toks[1]);
+    if (pad < 0 || pad >= 4)
+      return "FAIL pad out of range (0..3)";
+    if (!ParseHex(toks[2], buttons))
+      return "FAIL bad buttons";
+    sx = std::stof(toks[3]);
+    sy = std::stof(toks[4]);
+    csx = std::stof(toks[5]);
+    csy = std::stof(toks[6]);
+  }
+  catch (...)
+  {
+    return "FAIL parse error";
+  }
+  auto clamp = [](float v) { return v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v); };
+  sx = clamp(sx); sy = clamp(sy); csx = clamp(csx); csy = clamp(csy);
+
+  GCPadStatus st{};
+  st.button = static_cast<std::uint16_t>(buttons);
+  st.stickX = static_cast<std::uint8_t>(GCPadStatus::MAIN_STICK_CENTER_X +
+                                       static_cast<int>(sx * GCPadStatus::MAIN_STICK_RADIUS));
+  st.stickY = static_cast<std::uint8_t>(GCPadStatus::MAIN_STICK_CENTER_Y +
+                                       static_cast<int>(sy * GCPadStatus::MAIN_STICK_RADIUS));
+  st.substickX = static_cast<std::uint8_t>(GCPadStatus::C_STICK_CENTER_X +
+                                          static_cast<int>(csx * GCPadStatus::C_STICK_RADIUS));
+  st.substickY = static_cast<std::uint8_t>(GCPadStatus::C_STICK_CENTER_Y +
+                                          static_cast<int>(csy * GCPadStatus::C_STICK_RADIUS));
+  st.triggerLeft = (buttons & PAD_TRIGGER_L) ? 0xFF : 0;
+  st.triggerRight = (buttons & PAD_TRIGGER_R) ? 0xFF : 0;
+
+  auto& fp = s_forced_pads[pad];
+  {
+    std::lock_guard lk(fp.status_mtx);
+    fp.status = st;
+  }
+  fp.expire_ms.store(NowMs() + HIJACK_TIMEOUT_MS);
+  fp.active.store(true);
+  return "SUCCESS";
+}
+
 static std::string HandleSpeed(const std::vector<std::string>& toks)
 {
   // SPEED <factor>  -- 0.5 = half speed, 0 = unlimited
@@ -322,6 +512,9 @@ static void DispatchLine(Client& cl, const std::string& line)
   if (toks.empty())
     return;
 
+  // Stash current client so SUBSCRIBE handlers can mutate its sub list.
+  tl_current_client = &cl;
+
   std::string reply;
   const std::string& cmd = toks[0];
   if (cmd == "SAVE")
@@ -336,6 +529,16 @@ static void DispatchLine(Client& cl, const std::string& line)
     reply = HandleWriteMulti(toks);
   else if (cmd == "SPEED")
     reply = HandleSpeed(toks);
+  else if (cmd == "SUBSCRIBE")
+    reply = HandleSubscribe(toks);
+  else if (cmd == "SUBSCRIBE_MULTI")
+    reply = HandleSubscribeMulti(toks);
+  else if (cmd == "UNSUBSCRIBE")
+    reply = HandleUnsubscribe(toks);
+  else if (cmd == "UNSUBSCRIBE_MULTI")
+    reply = HandleUnsubscribeMulti(toks);
+  else if (cmd == "BUTTONSTATES_GC")
+    reply = HandleButtonStatesGC(toks);
   else if (cmd == "SCREENSHOT")
     reply = HandleScreenshot(toks);
   else if (cmd == "PAUSE")
@@ -347,12 +550,99 @@ static void DispatchLine(Client& cl, const std::string& line)
   else if (cmd == "STOP")
     reply = HandleStop(toks);
   else if (cmd == "PING")
-    reply = "PONG dolphin-oracle v0.3";
+    reply = "PONG dolphin-oracle v0.4";
   else
     reply = "FAIL unknown command: " + cmd;
 
   SendLine(*cl.socket, reply);
+  tl_current_client = nullptr;
 }
+
+// ---------------------------------------------------------------------------
+// Subscription poller thread: every 50ms scan all clients' subscriptions,
+// read memory, push EVENT line on each value change. Lives for the
+// duration of s_running.
+// ---------------------------------------------------------------------------
+
+static void PollerThread()
+{
+  Common::SetCurrentThreadName("DolphinOraclePoll");
+  while (s_running.load(std::memory_order_acquire))
+  {
+    if (s_system)
+    {
+      auto& memory = s_system->GetMemory();
+      std::lock_guard lk(s_clients_mtx);
+      for (auto& cl : s_clients)
+      {
+        if (!cl.socket)
+          continue;
+        for (auto& sub : cl.subs)
+        {
+          std::uint32_t v = 0;
+          if (sub.mode == 8) v = memory.Read_U8(sub.addr);
+          else if (sub.mode == 16) v = memory.Read_U16(sub.addr);
+          else if (sub.mode == 32) v = memory.Read_U32(sub.addr);
+          if (v != sub.prev_value)
+          {
+            sub.prev_value = v;
+            std::ostringstream msg;
+            msg.imbue(std::locale::classic());
+            msg << "EVENT " << std::hex << sub.addr << " " << std::dec << sub.mode
+                << " " << std::hex << v;
+            SendLine(*cl.socket, msg.str());
+          }
+        }
+        for (auto& sm : cl.subs_multi)
+        {
+          // Read range, compare to prev.
+          std::vector<std::uint8_t> cur(sm.size);
+          for (std::uint32_t i = 0; i < sm.size; ++i)
+            cur[i] = memory.Read_U8(sm.addr + i);
+          if (cur != sm.prev)
+          {
+            sm.prev = cur;
+            std::ostringstream msg;
+            msg.imbue(std::locale::classic());
+            msg << "EVENT_MULTI " << std::hex << sm.addr << " " << std::dec << sm.size
+                << " " << std::hex;
+            for (std::uint8_t b : cur)
+              msg << std::setw(2) << std::setfill('0') << static_cast<unsigned>(b);
+            SendLine(*cl.socket, msg.str());
+          }
+        }
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(SUB_POLL_MS));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// BUTTONSTATES_GC hook -- called from Pad::GetStatus() in modern Dolphin.
+// We patched Pad.cpp to call this; if it returns true Pad uses our state.
+// ---------------------------------------------------------------------------
+
+}  // anonymous namespace
+
+bool GetForcedGCPadStatus(int pad_num, GCPadStatus* out_status)
+{
+  if (pad_num < 0 || pad_num >= static_cast<int>(s_forced_pads.size()))
+    return false;
+  auto& fp = s_forced_pads[pad_num];
+  if (!fp.active.load(std::memory_order_acquire))
+    return false;
+  if (NowMs() > fp.expire_ms.load(std::memory_order_acquire))
+  {
+    fp.active.store(false);
+    return false;
+  }
+  std::lock_guard lk(fp.status_mtx);
+  *out_status = fp.status;
+  return true;
+}
+
+namespace
+{
 
 // ---------------------------------------------------------------------------
 // server thread: poll listener + each client for new bytes
@@ -448,8 +738,9 @@ void Init(Core::System& system)
   const unsigned short port = DEFAULT_PORT;
   s_running.store(true, std::memory_order_release);
   s_thread = std::thread(ServerThread, port);
+  s_sub_thread = std::thread(PollerThread);
   NOTICE_LOG_FMT(CORE,
-                 "[DolphinOracle] Oracle starting on port {} (v0.1)",
+                 "[DolphinOracle] Oracle starting on port {} (v0.4)",
                  port);
 }
 
@@ -459,6 +750,8 @@ void Shutdown()
     return;
   if (s_thread.joinable())
     s_thread.join();
+  if (s_sub_thread.joinable())
+    s_sub_thread.join();
   s_system = nullptr;
 }
 
