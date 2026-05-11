@@ -23,8 +23,10 @@
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
 #include "Core/HW/Memmap.h"
+#include "Core/HW/ProcessorInterface.h"
 #include "Core/State.h"
 #include "Core/System.h"
+#include "VideoCommon/FrameDumper.h"
 
 namespace DolphinOracle
 {
@@ -214,13 +216,51 @@ static std::string HandleScreenshot(const std::vector<std::string>& toks)
       path.push_back(' ');
     path += toks[i];
   }
-  // Core::SaveScreenShot accepts a name and writes <ScreenshotsDir>/<name>.png.
-  // For absolute paths we use the version that takes a name and trust the
-  // caller to know where Dolphin puts it. NOTE: This is best-effort -- the
-  // FrameDumper writes asynchronously; the file may appear a few frames
-  // later. Clients should poll the filesystem (the existing dolphin_watch.py
-  // SAVE helper already does this pattern).
-  Core::SaveScreenShot(path);
+  // Use the FrameDumper directly so we get the EXACT path the client asked
+  // for, not Dolphin's own Screenshots/ directory. The dumper writes
+  // asynchronously on the next frame_end -- client should poll filesystem.
+  if (g_frame_dumper)
+    g_frame_dumper->SaveScreenshot(path);
+  else
+    return "FAIL no framedumper";
+  return "SUCCESS";
+}
+
+// Lifecycle commands -- all need active emulation.
+
+static std::string HandlePause(const std::vector<std::string>&)
+{
+  if (!s_system)
+    return "FAIL no system";
+  if (Core::GetState(*s_system) != Core::State::Running)
+    return "FAIL not running";
+  Core::SetState(*s_system, Core::State::Paused);
+  return "SUCCESS";
+}
+
+static std::string HandleResume(const std::vector<std::string>&)
+{
+  if (!s_system)
+    return "FAIL no system";
+  if (Core::GetState(*s_system) != Core::State::Paused)
+    return "FAIL not paused";
+  Core::SetState(*s_system, Core::State::Running);
+  return "SUCCESS";
+}
+
+static std::string HandleReset(const std::vector<std::string>&)
+{
+  if (!s_system)
+    return "FAIL no system";
+  s_system->GetProcessorInterface().ResetButton_Tap();
+  return "SUCCESS";
+}
+
+static std::string HandleStop(const std::vector<std::string>&)
+{
+  if (!s_system)
+    return "FAIL no system";
+  Core::Stop(*s_system);
   return "SUCCESS";
 }
 
@@ -246,8 +286,16 @@ static void DispatchLine(Client& cl, const std::string& line)
     reply = HandleWrite(toks);
   else if (cmd == "SCREENSHOT")
     reply = HandleScreenshot(toks);
+  else if (cmd == "PAUSE")
+    reply = HandlePause(toks);
+  else if (cmd == "RESUME")
+    reply = HandleResume(toks);
+  else if (cmd == "RESET")
+    reply = HandleReset(toks);
+  else if (cmd == "STOP")
+    reply = HandleStop(toks);
   else if (cmd == "PING")
-    reply = "PONG dolphin-oracle v0.1";
+    reply = "PONG dolphin-oracle v0.2";
   else
     reply = "FAIL unknown command: " + cmd;
 
