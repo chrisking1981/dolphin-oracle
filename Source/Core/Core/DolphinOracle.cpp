@@ -205,6 +205,54 @@ static std::string HandleWrite(const std::vector<std::string>& toks)
   return "SUCCESS";
 }
 
+static std::string HandleWriteMulti(const std::vector<std::string>& toks)
+{
+  // WRITE_MULTI <addr_hex> <byte_hex> [<byte_hex>...]  -- atomic-ish batch
+  // write of N bytes starting at addr. All bytes go in the same dispatch
+  // so the emulator sees them on the same frame.
+  if (toks.size() < 3)
+    return "FAIL usage: WRITE_MULTI <addr_hex> <byte_hex>...";
+  if (!s_system)
+    return "FAIL no system";
+  std::uint32_t addr = 0;
+  if (!ParseHex(toks[1], addr))
+    return "FAIL bad addr";
+  auto& memory = s_system->GetMemory();
+  std::uint32_t cur = addr;
+  std::size_t count = 0;
+  for (std::size_t i = 2; i < toks.size(); ++i)
+  {
+    std::uint32_t v = 0;
+    if (!ParseHex(toks[i], v))
+      return "FAIL bad byte at idx " + std::to_string(i);
+    if (v > 0xFF)
+      return "FAIL byte > 0xFF at idx " + std::to_string(i);
+    memory.Write_U8(static_cast<std::uint8_t>(v), cur);
+    cur++;
+    count++;
+  }
+  return "SUCCESS " + std::to_string(count);
+}
+
+static std::string HandleSpeed(const std::vector<std::string>& toks)
+{
+  // SPEED <factor>  -- 0.5 = half speed, 0 = unlimited
+  if (toks.size() < 2)
+    return "FAIL usage: SPEED <factor>";
+  try
+  {
+    float factor = std::stof(toks[1]);
+    if (factor < 0.0f || factor > 100.0f)
+      return "FAIL factor out of range [0..100]";
+    Config::SetCurrent(Config::MAIN_EMULATION_SPEED, factor);
+    return "SUCCESS";
+  }
+  catch (...)
+  {
+    return "FAIL bad factor (use float)";
+  }
+}
+
 static std::string HandleScreenshot(const std::vector<std::string>& toks)
 {
   if (toks.size() < 2)
@@ -284,6 +332,10 @@ static void DispatchLine(Client& cl, const std::string& line)
     reply = HandleRead(toks);
   else if (cmd == "WRITE")
     reply = HandleWrite(toks);
+  else if (cmd == "WRITE_MULTI")
+    reply = HandleWriteMulti(toks);
+  else if (cmd == "SPEED")
+    reply = HandleSpeed(toks);
   else if (cmd == "SCREENSHOT")
     reply = HandleScreenshot(toks);
   else if (cmd == "PAUSE")
@@ -295,7 +347,7 @@ static void DispatchLine(Client& cl, const std::string& line)
   else if (cmd == "STOP")
     reply = HandleStop(toks);
   else if (cmd == "PING")
-    reply = "PONG dolphin-oracle v0.2";
+    reply = "PONG dolphin-oracle v0.3";
   else
     reply = "FAIL unknown command: " + cmd;
 
