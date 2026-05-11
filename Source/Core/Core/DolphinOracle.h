@@ -1,16 +1,26 @@
 // Copyright 2026 Dolphin Oracle Project (chrisking1981)
-// Based on TwitchPlaysPokemon/dolphinWatch (5.0DW-RC1) protocol.
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// External TCP control server for Dolphin. Lets a Python (or any TCP)
-// client drive savestate, memory R/W, controller input, screenshots, and
-// memory-change subscriptions over a simple newline-delimited protocol.
+// External TCP control server for Dolphin -- inspired by
+// TwitchPlaysPokemon/dolphinWatch but rebased on modern Dolphin master.
 //
-// Hello-world stage: just logs "Oracle alive" at Core::Init() to confirm
-// the integration plumbing works. Real TCP server is added in subsequent
-// commits.
+// Listens on a configurable TCP port (default 6000) for newline-delimited
+// commands from a Python (or any TCP) client:
+//
+//   SAVE <abs_path>              -- save savestate to file
+//   LOAD <abs_path>              -- load savestate from file
+//   READ <8|16|32> <addr_hex>    -- read PowerPC memory
+//   WRITE <8|16|32> <addr_hex> <val_hex>
+//   SCREENSHOT <abs_path>        -- save current framebuffer (Dolphin Oracle
+//                                   extension; original DolphinWatch lacked
+//                                   this).
+//
+// Each command replies with "SUCCESS" or "FAIL" + optional payload on a
+// single line.
 
 #pragma once
+
+#include <cstdint>
 
 namespace Core
 {
@@ -19,10 +29,15 @@ class System;
 
 namespace DolphinOracle
 {
-// Called once after Core::Init() succeeds.
-// Starts the TCP server (once the full implementation is in place).
+// Default TCP port if [General] OraclePort is unset.
+constexpr unsigned short DEFAULT_PORT = 6000;
+
+// Called once after Core::Init() so we can start the server thread.
+// Reads the desired port from Dolphin.ini (key [General] OraclePort);
+// falls back to DEFAULT_PORT.
 void Init(Core::System& system);
 
-// Called from Core::Stop() / shutdown to release resources.
+// Stop the server thread, close clients. Idempotent.
 void Shutdown();
+
 }  // namespace DolphinOracle
