@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -34,6 +35,16 @@
 #include <chrono>
 #include <cstring>
 #include <iomanip>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#include <Objidl.h>
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
+#endif
 
 namespace DolphinOracle
 {
@@ -226,6 +237,52 @@ static std::string HandleRead(const std::vector<std::string>& toks)
   {
     return "FAIL bad size (use 8|16|32)";
   }
+  return rep.str();
+}
+
+static std::string HandleDumpMem(const std::vector<std::string>& toks)
+{
+  // DUMP_MEM <addr_hex> <size_hex> <abs_path>
+  // Dump <size> guest bytes starting at <addr> straight to a file Dolphin-side
+  // (no per-word TCP round trips). Used to snapshot the full 24 MB MEM1 fast.
+  if (toks.size() < 4)
+    return "FAIL usage: DUMP_MEM <addr_hex> <size_hex> <abs_path>";
+  if (!s_system)
+    return "FAIL no system";
+  std::uint32_t addr = 0, size = 0;
+  if (!ParseHex(toks[1], addr) || !ParseHex(toks[2], size))
+    return "FAIL bad addr/size";
+  if (size == 0)
+    return "FAIL size is zero";
+  // Path may contain spaces; rejoin tokens 3..end.
+  std::string path = toks[3];
+  for (std::size_t i = 4; i < toks.size(); ++i)
+    path += " " + toks[i];
+
+  auto& memory = s_system->GetMemory();
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out)
+    return "FAIL cannot open path: " + path;
+
+  // Copy in modest blocks; Read_U8 honours the guest memory map.
+  std::vector<std::uint8_t> buf;
+  buf.reserve(0x10000);
+  std::uint32_t written = 0;
+  while (written < size)
+  {
+    const std::uint32_t block = std::min<std::uint32_t>(0x10000, size - written);
+    buf.clear();
+    for (std::uint32_t i = 0; i < block; ++i)
+      buf.push_back(memory.Read_U8(addr + written + i));
+    out.write(reinterpret_cast<const char*>(buf.data()), buf.size());
+    written += block;
+  }
+  out.close();
+
+  std::ostringstream rep;
+  rep.imbue(std::locale::classic());
+  rep << "SUCCESS DUMP_MEM " << std::hex << addr << " " << std::hex << size
+      << " -> " << path;
   return rep.str();
 }
 
@@ -443,6 +500,146 @@ static std::string HandleSpeed(const std::vector<std::string>& toks)
   }
 }
 
+#ifdef _WIN32
+struct WindowSearch
+{
+  DWORD pid = 0;
+  HWND hwnd = nullptr;
+};
+
+static BOOL CALLBACK FindMainWindowProc(HWND hwnd, LPARAM lparam)
+{
+  auto* search = reinterpret_cast<WindowSearch*>(lparam);
+  DWORD window_pid = 0;
+  GetWindowThreadProcessId(hwnd, &window_pid);
+  if (window_pid != search->pid || !IsWindowVisible(hwnd))
+    return TRUE;
+
+  RECT rect{};
+  if (!GetClientRect(hwnd, &rect))
+    return TRUE;
+  if ((rect.right - rect.left) < 64 || (rect.bottom - rect.top) < 64)
+    return TRUE;
+
+  search->hwnd = hwnd;
+  return FALSE;
+}
+
+static bool GetPngEncoderClsid(CLSID* clsid)
+{
+  UINT count = 0;
+  UINT bytes = 0;
+  Gdiplus::GetImageEncodersSize(&count, &bytes);
+  if (bytes == 0)
+    return false;
+
+  std::vector<unsigned char> buffer(bytes);
+  auto* encoders = reinterpret_cast<Gdiplus::ImageCodecInfo*>(buffer.data());
+  if (Gdiplus::GetImageEncoders(count, bytes, encoders) != Gdiplus::Ok)
+    return false;
+
+  for (UINT i = 0; i < count; ++i)
+  {
+    if (std::wcscmp(encoders[i].MimeType, L"image/png") == 0)
+    {
+      *clsid = encoders[i].Clsid;
+      return true;
+    }
+  }
+  return false;
+}
+
+static std::wstring WidenPath(const std::string& path)
+{
+  if (path.empty())
+    return {};
+  const int needed = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+  if (needed <= 0)
+    return std::wstring(path.begin(), path.end());
+  std::wstring wide(static_cast<size_t>(needed - 1), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wide.data(), needed);
+  return wide;
+}
+
+static std::string CaptureWindowPng(const std::string& path)
+{
+  WindowSearch search;
+  search.pid = GetCurrentProcessId();
+  EnumWindows(FindMainWindowProc, reinterpret_cast<LPARAM>(&search));
+  if (!search.hwnd)
+    return "FAIL no visible dolphin window";
+
+  RECT client{};
+  if (!GetClientRect(search.hwnd, &client))
+    return "FAIL GetClientRect";
+  POINT origin{0, 0};
+  if (!ClientToScreen(search.hwnd, &origin))
+    return "FAIL ClientToScreen";
+
+  const int width = client.right - client.left;
+  const int height = client.bottom - client.top;
+  if (width <= 0 || height <= 0)
+    return "FAIL empty client rect";
+
+  Gdiplus::GdiplusStartupInput startup_input;
+  ULONG_PTR token = 0;
+  if (Gdiplus::GdiplusStartup(&token, &startup_input, nullptr) != Gdiplus::Ok)
+    return "FAIL gdiplus startup";
+
+  HDC screen_dc = GetDC(nullptr);
+  if (!screen_dc)
+  {
+    Gdiplus::GdiplusShutdown(token);
+    return "FAIL GetDC";
+  }
+  HDC mem_dc = CreateCompatibleDC(screen_dc);
+  HBITMAP hbitmap = CreateCompatibleBitmap(screen_dc, width, height);
+  if (!mem_dc || !hbitmap)
+  {
+    if (hbitmap)
+      DeleteObject(hbitmap);
+    if (mem_dc)
+      DeleteDC(mem_dc);
+    ReleaseDC(nullptr, screen_dc);
+    Gdiplus::GdiplusShutdown(token);
+    return "FAIL CreateCompatibleBitmap";
+  }
+
+  HGDIOBJ old_obj = SelectObject(mem_dc, hbitmap);
+  BOOL copied = PrintWindow(search.hwnd, mem_dc, 0x2);
+  if (!copied)
+    copied = BitBlt(mem_dc, 0, 0, width, height, screen_dc, origin.x, origin.y, SRCCOPY);
+  SelectObject(mem_dc, old_obj);
+  ReleaseDC(nullptr, screen_dc);
+
+  Gdiplus::Status status = Gdiplus::Ok;
+  if (!copied)
+  {
+    status = Gdiplus::GenericError;
+  }
+  else
+  {
+    Gdiplus::Bitmap bitmap(hbitmap, nullptr);
+    CLSID png_clsid{};
+    if (!GetPngEncoderClsid(&png_clsid))
+    {
+      DeleteObject(hbitmap);
+      DeleteDC(mem_dc);
+      Gdiplus::GdiplusShutdown(token);
+      return "FAIL no png encoder";
+    }
+    status = bitmap.Save(WidenPath(path).c_str(), &png_clsid, nullptr);
+  }
+  DeleteObject(hbitmap);
+  DeleteDC(mem_dc);
+  Gdiplus::GdiplusShutdown(token);
+
+  if (status != Gdiplus::Ok)
+    return "FAIL window png capture status " + std::to_string(static_cast<int>(status));
+  return "SUCCESS";
+}
+#endif
+
 static std::string HandleScreenshot(const std::vector<std::string>& toks)
 {
   if (toks.size() < 2)
@@ -454,9 +651,17 @@ static std::string HandleScreenshot(const std::vector<std::string>& toks)
       path.push_back(' ');
     path += toks[i];
   }
-  // Use the FrameDumper directly so we get the EXACT path the client asked
-  // for, not Dolphin's own Screenshots/ directory. The dumper writes
-  // asynchronously on the next frame_end -- client should poll filesystem.
+  // On Windows test harnesses need a deterministic file immediately. Dolphin's
+  // frame dumper can accept a screenshot request yet never flush for some DOL
+  // runs, so capture the visible render client directly through the oracle TCP
+  // command. This keeps texture/frame dumping disabled.
+#ifdef _WIN32
+  const std::string window_result = CaptureWindowPng(path);
+  if (window_result == "SUCCESS")
+    return window_result;
+#endif
+
+  // Fallback to Dolphin's frame dumper for non-Windows or hidden-window cases.
   if (g_frame_dumper)
     g_frame_dumper->SaveScreenshot(path);
   else
@@ -527,6 +732,8 @@ static void DispatchLine(Client& cl, const std::string& line)
     reply = HandleWrite(toks);
   else if (cmd == "WRITE_MULTI")
     reply = HandleWriteMulti(toks);
+  else if (cmd == "DUMP_MEM")
+    reply = HandleDumpMem(toks);
   else if (cmd == "SPEED")
     reply = HandleSpeed(toks);
   else if (cmd == "SUBSCRIBE")
@@ -550,7 +757,7 @@ static void DispatchLine(Client& cl, const std::string& line)
   else if (cmd == "STOP")
     reply = HandleStop(toks);
   else if (cmd == "PING")
-    reply = "PONG dolphin-oracle v0.4";
+    reply = "PONG dolphin-oracle v0.5";
   else
     reply = "FAIL unknown command: " + cmd;
 
